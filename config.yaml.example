@@ -1,0 +1,77 @@
+predbat_guard:
+  module: i1_predbat_guard
+  class: PredbatGuard
+
+  # REQUIRED. Where alerts go — the notify service name WITHOUT the "notify."
+  # domain prefix. The app refuses to start without this: a guard that cannot
+  # tell anyone is worse than no guard, because it looks like coverage.
+  notify_targets:
+    - mobile_app_my_phone
+
+  # Android notification channel. Leave as-is unless you have a reason: a
+  # notification naming no channel goes to the companion app's default channel,
+  # which is disabled on some phones, and Android discards it while
+  # Home Assistant reports success. See T-52.
+  notification_channel: predbat_guard_alerts
+  notification_priority: high
+
+  # REQUIRED. The Huawei entity whose transition to "unavailable" stands in for
+  # a Modbus coordinator failure.
+  #
+  # This is a PROXY, not the log line. HA logs "Timeout communicating with
+  # TA21X0123456" but that log is not reachable from inside the AppDaemon
+  # container without a token and a mount. The entity going unavailable is what
+  # a coordinator failure produces, but it will also fire on an integration
+  # reload or an HA restart — so the counts are an upper bound. They feed the
+  # burst and rate rules only; the rule that matters (write stall) does not
+  # depend on them.
+  availability_entity: sensor.battery_state_of_capacity
+
+  # REQUIRED. The baseline this guard compares against — backlog H-44f. The grid
+  # operator can push settings to this inverter remotely and nothing announces
+  # it, so comparison is the only detection. A setting that goes MISSING counts
+  # as drift: an entity that stopped existing is not reassurance.
+  #
+  # Values below were captured 2026-09-28 and match
+  # entities in Home Assistant, and update them after a
+  # deliberate change, or this will page you about your own edit.
+  expected_settings:
+    select.battery_working_mode: "time_of_use_luna2000"
+    select.battery_capacity_control_mode: "active_capacity_control"
+    number.battery_grid_charge_cutoff_soc: "80.0"
+    number.battery_end_of_discharge_soc: "10.0"
+    number.battery_maximum_discharging_power: "2500"
+    switch.predbat_set_read_only: "off"
+
+  # Predbat's write counter and its status entity. The status entity's "debug"
+  # attribute carries best_charge_window / best_export_window, which is how the
+  # guard knows whether the plan currently wants Predbat to be acting.
+  writes_entity: predbat.inverter_register_writes
+  status_entity: predbat.status
+
+  # Modbus thresholds. Measured 2026-09-20..09-28: 19 timeouts over 9 days, so
+  # 1-2 per day in ones and twos, plus one burst of 6 inside 10 minutes on 09-20.
+  #
+  # There is deliberately NO time-of-day window here. The first version of H-44d
+  # assumed the timeouts were 00:00-01:00 inverter housekeeping; nine days showed
+  # the first timeout of each day drifting ~+23 min/day (20:19, 20:39, 21:13,
+  # 21:29, 21:53, 22:16), so any fixed window is wrong within a week.
+  burst_count: 3           # >= this many timeouts ...
+  burst_window: 900        # ... within this many seconds = the link is degrading
+  rate_max: 3              # more than this many ...
+  rate_window: 86400       # ... in this window = above the 1-2/day baseline
+
+  # Scan interval, seconds. Minimum 60; Predbat replans every ~5 min so polling
+  # faster only adds load.
+  interval: 300
+
+  # Policy D2. The FIRST alert for a condition always sends, whatever the hour —
+  # quiet hours suppress nagging, not news. Repeats are held during the window
+  # and land promptly when it opens rather than waiting a further full interval.
+  quiet_start: 22          # hour 0-23, inclusive
+  quiet_end: 7             # hour 0-23, exclusive
+  repeat_after: 21600      # 6h, seconds
+
+  # Timeout history and send-times are persisted here so a reload does not reset
+  # every cooldown and re-notify everything. Written atomically.
+  state_file: /conf/predbat_guard_state.json
