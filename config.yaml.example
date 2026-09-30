@@ -32,11 +32,11 @@ predbat_guard:
   # it, so comparison is the only detection. A setting that goes MISSING counts
   # as drift: an entity that stopped existing is not reassurance.
   #
-  # Values below were captured 2026-09-28 and match
+  # The values below are examples. Read your own from the inverter
   # entities in Home Assistant, and update them after a
   # deliberate change, or this will page you about your own edit.
   expected_settings:
-    select.battery_working_mode: "time_of_use_luna2000"
+    select.battery_working_mode: "maximise_self_consumption"
     select.battery_capacity_control_mode: "active_capacity_control"
     number.battery_grid_charge_cutoff_soc: "80.0"
     number.battery_end_of_discharge_soc: "10.0"
