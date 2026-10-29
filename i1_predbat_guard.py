@@ -59,8 +59,14 @@ from typing import Any
 
 import appdaemon.plugins.hass.hassapi as hass
 
+import irisone_bus
 import notification_policy as policy
 import predbat_rules as rules
+
+# Owner, IQ-22 2026-10-29: money is being lost now, and it can be fixed remotely
+# -> urgent. Burst and rate are early warnings of a degrading link; if it
+# degrades far enough, WRITE_STALL fires anyway -> non-urgent.
+URGENT_RULES = frozenset({rules.WRITE_STALL, rules.BASELINE_DRIFT})
 
 HA_UNAVAILABLE_STATES = frozenset({"unavailable", "unknown", ""})
 
@@ -101,6 +107,13 @@ class PredbatGuard(hass.Hass):
     """Watches that Predbat is still really driving the inverter."""
 
     def initialize(self) -> None:
+        # A-71.5: an older shared module winning AppDaemon's import path must stop
+        # the app here, where the watchdog sees it, not at the first alert.
+        if not hasattr(policy, "should_notify") or not hasattr(irisone_bus, "presence_for_target"):
+            raise RuntimeError(f"stale shared module on the import path: "
+                               f"{policy.__file__}, {irisone_bus.__file__}")
+        # (rule, target) -> presence `since` of the last logged drop (O3).
+        self._drop_logged: dict = {}
         self.notify_targets = self._require_list("notify_targets")
         self.expected_settings = self._require_mapping("expected_settings")
 
@@ -272,6 +285,7 @@ class PredbatGuard(hass.Hass):
         self.last_writes = writes
 
         by_key = {f["rule"]: f for f in findings}
+        before = dict(self.sent)
         to_send, held, self.sent = policy.apply(
             by_key.keys(),
             now_epoch=now,
@@ -282,15 +296,33 @@ class PredbatGuard(hass.Hass):
             repeat_after=self.repeat_after,
         )
         for key, reason in to_send:
-            self.alert(by_key[key], reason)
+            if self.alert(by_key[key], reason) == 0:
+                # apply() marked the rule before anyone was gated; nobody was
+                # reached, so the repeat interval must not start (IQ-13).
+                self.sent = policy.uncommit(self.sent, before, key)
         for key, reason in held:
             self.log(f"holding {key}: {reason}", level="INFO")
         self.save_state()
 
-    def alert(self, finding: dict[str, Any], reason: str) -> None:
+    def alert(self, finding: dict[str, Any], reason: str) -> int:
+        """Notify every target, minus non-urgent drops for anyone away. Returns reached."""
         message = finding["detail"]
-        self.log(f"ALERT {finding['rule']} ({reason}): {message}", level="ERROR")
+        rule = finding["rule"]
+        self.log(f"ALERT {rule} ({reason}): {message}", level="ERROR")
+        domain = self.get_state(irisone_bus.DOMAIN)
+        now_epoch = time.time()
+        reached = 0
         for target in self.notify_targets:
+            in_home, since = irisone_bus.presence_for_target(domain, target, now_epoch)
+            if rule in URGENT_RULES:
+                send, gate_reason = policy.should_notify(policy.URGENT, in_home)
+            else:
+                send, gate_reason = policy.should_notify(policy.NON_URGENT, in_home)
+            self._report_gate(rule, target, send, gate_reason)
+            if not send:
+                if policy.drop_log_due(rule, target, since, self._drop_logged):
+                    self.log(f"[presence] dropped {self.name}/{rule} to {target}: {gate_reason}")
+                continue
             try:
                 self.call_service(
                     f"notify/{target}",
@@ -302,5 +334,16 @@ class PredbatGuard(hass.Hass):
                         "ttl": 0,
                     },
                 )
+                reached += 1
             except Exception as exc:  # a failed notify must not kill the scan
                 self.log(f"notify {target} failed: {exc}", level="ERROR")
+        return reached
+
+    def _report_gate(self, rule: str, target: str, send: bool, reason: str) -> None:
+        """Count the decision in irisone.notify_gate_stats (IQ-28). Never blocks a send."""
+        try:
+            urgency = policy.URGENT if rule in URGENT_RULES else policy.NON_URGENT
+            self.fire_event(irisone_bus.GATE_EVENT, **irisone_bus.gate_event(
+                self.name, rule, target, urgency, send, reason))
+        except Exception as exc:  # the counter is evidence, not a dependency
+            self.log(f"[presence] could not report gate decision: {exc}", level="WARNING")
