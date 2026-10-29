@@ -16,6 +16,14 @@ The rules, in the order they are applied to one condition:
 
 A condition that clears is forgotten, so if it returns it is news again.
 
+**Rule 0, before all of the above: the presence gate (T-71).** Every send
+states its urgency, and a NON_URGENT send to a recipient who is not home is
+dropped. The gate runs first, per recipient, and a drop never touches D2 state:
+if the condition is still true when the person comes home, the app's next
+regular check sends it (owner ruling IQ-13, 2026-10-29). `uncommit` exists for
+`apply()` callers, which mark a key sent before they know whether anyone was
+reached.
+
 State is a plain dict of `{key: last_sent_epoch}`, JSON-serialisable so the
 caller can persist it across restarts. That matters: without it a reload resets
 every cooldown and re-notifies everything, which is the "redundant restart-time
@@ -99,3 +107,64 @@ def apply(
             new_state[key] = state[key]
 
     return to_send, held, new_state
+
+
+# --- Presence gate (T-71; owner decisions 2026-10-29, docs/planning/T-69-interview.md) ---
+
+URGENT = "urgent"
+NON_URGENT = "non_urgent"
+
+SEND_URGENT = "urgent"
+SEND_URGENT_AWAY = "urgent, recipient away"
+SEND_HOME = "recipient home"
+SEND_PRESENCE_UNKNOWN = "presence unknown, fail open"
+DROP_AWAY = "non-urgent, recipient away"
+
+
+def should_notify(urgency, in_home):
+    """Return (send: bool, reason: str) for one notification to one recipient.
+
+    `urgency` is mandatory and must be URGENT or NON_URGENT (IQ-12): anything
+    else raises, so a typo fails loud at the first send instead of quietly
+    picking a class. `in_home` is what irisone_bus.in_home_for_target returned:
+    True, False, or None when presence is missing, stale or unknown. None sends.
+    Only NON_URGENT with in_home False is dropped.
+    """
+    if urgency not in (URGENT, NON_URGENT):
+        raise ValueError(f"urgency must be {URGENT!r} or {NON_URGENT!r}, got {urgency!r}")
+    if urgency == URGENT:
+        return True, SEND_URGENT_AWAY if in_home is False else SEND_URGENT
+    if in_home is None:
+        return True, SEND_PRESENCE_UNKNOWN
+    if in_home:
+        return True, SEND_HOME
+    return False, DROP_AWAY
+
+
+def drop_log_due(key, target, presence_since, logged):
+    """True the first time (key, target) is dropped in one away episode.
+
+    `presence_since` is the presence entity's `since` attribute, which changes
+    on every published transition, so a new episode logs again. Mutates
+    `logged`. This keeps a 60 s re-check loop to one INFO line per away
+    episode per notification (O3), not 60 an hour.
+    """
+    marker = logged.get((key, target))
+    if marker is not None and marker == presence_since:
+        return False
+    logged[(key, target)] = presence_since
+    return True
+
+
+def uncommit(new_state, old_state, key):
+    """Undo `apply()`'s mark for `key` when the send reached nobody.
+
+    Restores the previous timestamp, or removes the key if it was new, so a
+    dropped send does not start the repeat interval. Returns a new dict.
+    """
+    out = dict(new_state)
+    if key in old_state:
+        out[key] = old_state[key]
+    else:
+        out.pop(key, None)
+    return out
