@@ -39,6 +39,15 @@ DEFAULT_BURST_COUNT = 3
 DEFAULT_BURST_WINDOW = 900  # 15 minutes, seconds
 DEFAULT_RATE_MAX = 3  # per rolling 24h; baseline is 1-2
 DEFAULT_RATE_WINDOW = 86400
+# Measured 2026-11-10: Predbat writes up to ~5 min before a window starts, and
+# restores its settings within one 5-minute cycle after it ends.
+DEFAULT_WRITE_LEAD = 1800  # a write this long before a window still counts
+DEFAULT_WRITE_GRACE = 600  # give Predbat this long into a window before judging
+DEFAULT_CONTROL_BEFORE = 900  # Predbat may change its settings this early ...
+DEFAULT_CONTROL_AFTER = 600  # ... and restore them this late
+# Settings Predbat itself changes during a window (discharge power is set to 0
+# while it charges). Drift on these is only judged outside windows.
+DEFAULT_PREDBAT_CONTROLLED = ("number.battery_maximum_discharging_power",)
 
 BURST = "modbus_burst"
 RATE = "modbus_rate"
@@ -103,45 +112,87 @@ def plan_wants_action(windows: Iterable[Mapping[str, float]], now: float) -> boo
     return any(w["start"] <= now < w["end"] for w in windows)
 
 
+def merge_windows(windows: Iterable[Mapping[str, float]]) -> list[dict[str, float]]:
+    """Join windows that touch, so one long charge run counts as one window.
+
+    Predbat lists a run of 15-minute slots as separate windows. It writes to the
+    inverter when a run starts, not at every slot inside it.
+    """
+    merged: list[dict[str, float]] = []
+    for w in sorted(windows, key=lambda w: w["start"]):
+        if merged and w["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], w["end"])
+        else:
+            merged.append({"start": w["start"], "end": w["end"]})
+    return merged
+
+
 def write_stall(
     writes_now: int,
     writes_before: int,
     windows: Iterable[Mapping[str, float]],
     now: float,
+    last_change: float | None = None,
+    lead: float = DEFAULT_WRITE_LEAD,
+    grace: float = DEFAULT_WRITE_GRACE,
 ) -> dict[str, Any] | None:
-    """Return a finding only if the write counter is static while the plan is acting.
+    """Return a finding only if Predbat never wrote for a window that is under way.
 
-    Both halves are required. A static counter with no active window is the
-    normal idle case and must never alert — see the module docstring for the
-    three-hour benign stall this guards against.
+    Predbat writes when a window starts (measured 2026-11-10: two writes at
+    09:10-09:16 for the 09:15-09:30 window, then none until it ended), so a static
+    counter *inside* a window is normal. The stall is: a window has run for
+    `grace` seconds and the counter has not moved since `lead` seconds before it
+    began. `last_change` is when the counter last moved; None means never seen.
+    A static counter with no active window is the normal idle case and never
+    alerts -- see the module docstring for the three-hour benign stall.
     """
     if writes_now != writes_before:
         return None
-    if not plan_wants_action(windows, now):
-        return None
-    return {
-        "rule": WRITE_STALL,
-        "writes": writes_now,
-        "detail": (
-            f"inverter_register_writes stuck at {writes_now} while a charge/export "
-            f"window is active — Predbat believes it acted; the inverter may not have"
-        ),
-    }
+    for w in merge_windows(windows):
+        if not (w["start"] + grace <= now < w["end"]):
+            continue
+        if last_change is not None and last_change >= w["start"] - lead:
+            continue
+        return {
+            "rule": WRITE_STALL,
+            "writes": writes_now,
+            "detail": (
+                f"inverter_register_writes stuck at {writes_now}: no write since "
+                f"{int(lead / 60)} min before a charge/export window that started "
+                f"{int((now - w['start']) / 60)} min ago -- the inverter may not "
+                f"have been set"
+            ),
+        }
+    return None
+
+
+def in_control_period(
+    windows: Iterable[Mapping[str, float]],
+    now: float,
+    before: float = DEFAULT_CONTROL_BEFORE,
+    after: float = DEFAULT_CONTROL_AFTER,
+) -> bool:
+    """True while Predbat may legitimately hold its own settings for a window."""
+    return any(w["start"] - before <= now < w["end"] + after for w in windows)
 
 
 def baseline_drift(
     expected: Mapping[str, str],
     actual: Mapping[str, str | None],
+    skip: Iterable[str] = (),
 ) -> dict[str, Any] | None:
     """Return a finding if any watched setting no longer matches the baseline.
 
     This is H-44f: the grid operator can push settings to the inverter and
     nothing announces it, so the only detection is comparison. A setting that has
     gone *missing* counts as drift — an entity that stopped existing is not
-    reassurance.
+    reassurance. Keys in `skip` are not compared (Predbat is driving them now).
     """
+    skip = set(skip)
     changed = []
     for key in sorted(expected):
+        if key in skip:
+            continue
         want = str(expected[key])
         got = actual.get(key)
         if got is None:
@@ -170,6 +221,8 @@ def evaluate(
     burst_window: float = DEFAULT_BURST_WINDOW,
     rate_max: int = DEFAULT_RATE_MAX,
     rate_window: float = DEFAULT_RATE_WINDOW,
+    last_change: float | None = None,
+    controlled: Iterable[str] = DEFAULT_PREDBAT_CONTROLLED,
 ) -> list[dict[str, Any]]:
     """Run every rule and return the findings, most serious first.
 
@@ -177,9 +230,10 @@ def evaluate(
     now, drift means somebody else changed it, and the Modbus counts are context.
     """
     windows = list(windows)
+    skip = controlled if in_control_period(windows, now) else ()
     findings = [
-        write_stall(writes_now, writes_before, windows, now),
-        baseline_drift(expected, actual),
+        write_stall(writes_now, writes_before, windows, now, last_change),
+        baseline_drift(expected, actual, skip),
         find_burst(timeouts, now, count=burst_count, window=burst_window),
         find_rate(timeouts, now, maximum=rate_max, window=rate_window),
     ]

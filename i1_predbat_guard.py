@@ -159,6 +159,11 @@ class PredbatGuard(hass.Hass):
         state = self.load_state()
         self.timeouts: list[float] = state.get("timeouts", [])
         self.last_writes: int | None = state.get("last_writes")
+        # When the write counter last moved. Unknown after a restart: start the
+        # clock now, so a window already under way is not judged blind.
+        self.last_write_change: float = state.get("last_write_change") or time.time()
+        self.predbat_controlled = list(self.args.get(
+            "predbat_controlled_settings", rules.DEFAULT_PREDBAT_CONTROLLED))
         self.sent: dict[str, float] = state.get("sent", {})
 
         self.listen_state(
@@ -216,6 +221,7 @@ class PredbatGuard(hass.Hass):
             "version": STATE_VERSION,
             "timeouts": self.timeouts[-500:],
             "last_writes": self.last_writes,
+            "last_write_change": self.last_write_change,
             "sent": self.sent,
         }
         tmp = f"{self.state_file}.tmp"
@@ -269,6 +275,8 @@ class PredbatGuard(hass.Hass):
             return
 
         previous = self.last_writes if self.last_writes is not None else writes
+        if writes != previous:
+            self.last_write_change = now
         findings = rules.evaluate(
             timeouts=self.timeouts,
             writes_now=writes,
@@ -281,6 +289,8 @@ class PredbatGuard(hass.Hass):
             burst_window=self.burst_window,
             rate_max=self.rate_max,
             rate_window=self.rate_window,
+            last_change=self.last_write_change,
+            controlled=self.predbat_controlled,
         )
         self.last_writes = writes
 
