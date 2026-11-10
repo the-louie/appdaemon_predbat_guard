@@ -127,6 +127,31 @@ def merge_windows(windows: Iterable[Mapping[str, float]]) -> list[dict[str, floa
     return merged
 
 
+def track_run(
+    windows: Iterable[Mapping[str, float]],
+    now: float,
+    run_start: float | None,
+) -> tuple[list[dict[str, float]], float | None]:
+    """Give the active window its real start, remembered across scans.
+
+    Predbat's plan only lists slots from the current one on: measured 2026-11-10,
+    a charge run programmed at 10:15 showed in the plan as starting 11:00, 11:15,
+    11:30 ... as each slot passed. Judged against that moving start, a run with
+    its one write at 10:15 looked unwritten every 15 min (ten false alerts
+    11:14-13:29). `run_start` is what the previous scan returned: the start of
+    the run that was active then. Returns the merged windows, with the active one
+    starting at the earlier of the two, and the value to pass in next scan (None
+    when no window is active, so separate runs are never joined).
+    """
+    merged = merge_windows(windows)
+    for w in merged:
+        if w["start"] <= now < w["end"]:
+            if run_start is not None and run_start < w["start"]:
+                w["start"] = run_start
+            return merged, w["start"]
+    return merged, None
+
+
 def write_stall(
     writes_now: int,
     writes_before: int,

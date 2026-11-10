@@ -162,6 +162,12 @@ class PredbatGuard(hass.Hass):
         # When the write counter last moved. Unknown after a restart: start the
         # clock now, so a window already under way is not judged blind.
         self.last_write_change: float = state.get("last_write_change") or time.time()
+        # Start of the charge/export run active at the last scan (rules.track_run).
+        # A state file from before run tracking cannot say when a run under way
+        # began: do not judge that run (restart the write clock now).
+        self.run_start: float | None = state.get("run_start")
+        if "run_start" not in state:
+            self.last_write_change = time.time()
         self.predbat_controlled = list(self.args.get(
             "predbat_controlled_settings", rules.DEFAULT_PREDBAT_CONTROLLED))
         self.sent: dict[str, float] = state.get("sent", {})
@@ -222,6 +228,7 @@ class PredbatGuard(hass.Hass):
             "timeouts": self.timeouts[-500:],
             "last_writes": self.last_writes,
             "last_write_change": self.last_write_change,
+            "run_start": self.run_start,
             "sent": self.sent,
         }
         tmp = f"{self.state_file}.tmp"
@@ -277,11 +284,12 @@ class PredbatGuard(hass.Hass):
         previous = self.last_writes if self.last_writes is not None else writes
         if writes != previous:
             self.last_write_change = now
+        windows, self.run_start = rules.track_run(self.plan_windows(), now, self.run_start)
         findings = rules.evaluate(
             timeouts=self.timeouts,
             writes_now=writes,
             writes_before=previous,
-            windows=self.plan_windows(),
+            windows=windows,
             expected=self.expected_settings,
             actual=self.current_settings(),
             now=now,
