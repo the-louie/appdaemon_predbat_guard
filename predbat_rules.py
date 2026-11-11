@@ -112,6 +112,42 @@ def plan_wants_action(windows: Iterable[Mapping[str, float]], now: float) -> boo
     return any(w["start"] <= now < w["end"] for w in windows)
 
 
+DEFAULT_PLAN_MAX_AGE = 1800  # reuse the last plan this long while Predbat shows a warning
+
+
+def has_plan(debug: str) -> bool:
+    """True if Predbat's status `debug` attribute carries its plan at all.
+
+    While a warning is on the status sensor ("Warn: Return bad float value
+    unavailable from pv_power [Hold charging]") the sensor keeps the warning's own
+    debug, which has no plan (measured 2026-11-11 02:09 and 04:09). An empty plan
+    is still a plan: `best_charge_window=[]` means nothing is planned.
+    """
+    return "best_charge_window=" in (debug or "")
+
+
+def choose_plan(
+    windows: list[dict[str, float]],
+    plan_present: bool,
+    last: list[dict[str, float]] | None,
+    last_at: float | None,
+    now: float,
+    max_age: float = DEFAULT_PLAN_MAX_AGE,
+) -> tuple[list[dict[str, float]], list[dict[str, float]] | None, float | None]:
+    """Use this scan's plan, or the last one seen while the status shows none.
+
+    Returns (windows to judge with, plan to remember, when it was seen). A
+    remembered plan older than `max_age` is dropped: Predbat replans every 5 min,
+    so a warning that outlasts it is no longer a blip, and the rules judge it
+    with no windows, as before.
+    """
+    if plan_present:
+        return windows, windows, now
+    if last is not None and last_at is not None and now - last_at <= max_age:
+        return last, last, last_at
+    return windows, None, None
+
+
 def merge_windows(windows: Iterable[Mapping[str, float]]) -> list[dict[str, float]]:
     """Join windows that touch, so one long charge run counts as one window.
 

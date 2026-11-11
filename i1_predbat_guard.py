@@ -168,6 +168,10 @@ class PredbatGuard(hass.Hass):
         self.run_start: float | None = state.get("run_start")
         if "run_start" not in state:
             self.last_write_change = time.time()
+        # Last plan read from Predbat's status, for scans while a warning hides
+        # it (rules.choose_plan). Memory only: a restart starts without one.
+        self.last_plan: list[dict[str, float]] | None = None
+        self.last_plan_at: float | None = None
         self.predbat_controlled = list(self.args.get(
             "predbat_controlled_settings", rules.DEFAULT_PREDBAT_CONTROLLED))
         self.sent: dict[str, float] = state.get("sent", {})
@@ -266,7 +270,11 @@ class PredbatGuard(hass.Hass):
         debug = self.get_state(self.status_entity, attribute="debug") or ""
         now = self.get_now()
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return parse_plan_windows(debug, midnight.timestamp())
+        windows = parse_plan_windows(debug, midnight.timestamp())
+        windows, self.last_plan, self.last_plan_at = rules.choose_plan(
+            windows, rules.has_plan(debug), self.last_plan, self.last_plan_at,
+            time.time())
+        return windows
 
     # ------------------------------------------------------------------ scan
 
